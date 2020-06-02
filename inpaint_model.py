@@ -17,6 +17,7 @@ from inpaint_ops import gen_conv, gen_deconv, dis_conv
 from inpaint_ops import random_bbox, bbox2mask, local_patch, brush_stroke_mask
 from inpaint_ops import resize_mask_like, contextual_attention
 
+import numpy as np
 
 logger = logging.getLogger()
 
@@ -128,6 +129,99 @@ class InpaintCAModel(Model):
                 batch, reuse=reuse, training=training)
             return d
 
+    def build_graph_with_losses_adv(
+            self, FLAGS, batch_data, mask, training=True, summary=False,
+            reuse=False):
+        if FLAGS.guided:
+            batch_data, edge = batch_data
+            edge = edge[:, :, :, 0:1] / 255.
+            edge = tf.cast(edge > FLAGS.edge_threshold, tf.float32)
+        batch_pos = batch_data / 127.5 - 1.
+        # generate mask, 1 represents masked point
+        bbox = random_bbox(FLAGS)
+        regular_mask = bbox2mask(FLAGS, bbox, name='mask_c')
+        irregular_mask = brush_stroke_mask(FLAGS, name='mask_c')
+        print('******')
+        if mask == '':
+            print('in right mask')
+            mask = tf.cast(
+                tf.logical_or(
+                    tf.cast(irregular_mask, tf.bool),
+                    tf.cast(regular_mask, tf.bool),
+                ),
+                tf.float32
+            )
+        else:
+            mask = mask
+        
+        batch_incomplete = batch_pos*(1.-mask)
+        if FLAGS.guided:
+            edge = edge * mask
+            xin = tf.concat([batch_incomplete, edge], axis=3)
+        else:
+            xin = batch_incomplete
+        x1, x2, offset_flow = self.build_inpaint_net(
+            xin, mask, reuse=reuse, training=training,
+            padding=FLAGS.padding)
+        batch_predicted = x2
+        losses = {}
+        # apply mask and complete image
+        batch_complete = batch_predicted*mask + batch_incomplete*(1.-mask)
+        
+        # local patches
+        losses['ae_coarse_loss'] = FLAGS.l1_loss_alpha * tf.reduce_mean(tf.abs(batch_pos - x1))
+        losses['ae_loss'] = FLAGS.l1_loss_alpha * tf.reduce_mean(tf.abs(batch_pos - x1))
+        losses['ae_loss'] += FLAGS.l1_loss_alpha * tf.reduce_mean(tf.abs(batch_pos - x2))
+        
+        if summary:
+            scalar_summary('losses/ae_loss', losses['ae_loss'])
+            if FLAGS.guided:
+                viz_img = [
+                    batch_pos,
+                    batch_incomplete + edge,
+                    batch_complete]
+            else:
+                viz_img = [batch_pos, batch_incomplete, batch_complete]
+            if offset_flow is not None:
+                viz_img.append(
+                    resize(offset_flow, scale=4,
+                           func=tf.image.resize_bilinear))
+            images_summary(
+                tf.concat(viz_img, axis=2),
+                'raw_incomplete_predicted_complete', FLAGS.viz_max_out)
+
+        # gan
+        batch_pos_neg = tf.concat([batch_pos, batch_complete], axis=0)
+        if FLAGS.gan_with_mask:
+            batch_pos_neg = tf.concat([batch_pos_neg, tf.tile(mask, [FLAGS.batch_size*2, 1, 1, 1])], axis=3)
+        if FLAGS.guided:
+            # conditional GANs
+            batch_pos_neg = tf.concat([batch_pos_neg, tf.tile(edge, [2, 1, 1, 1])], axis=3)
+        # wgan with gradient penalty
+        if FLAGS.gan == 'sngan':
+            print('Pos-neg shape is:', batch_pos_neg.shape)
+            pos_neg = self.build_gan_discriminator(batch_pos_neg, training=training, reuse=reuse)
+            pos, neg = tf.split(pos_neg, 2)
+            g_loss, d_loss = gan_hinge_loss(pos, neg)
+            losses['g_loss'] = g_loss
+            losses['d_loss'] = d_loss
+        else:
+            raise NotImplementedError('{} not implemented.'.format(FLAGS.gan))
+        if summary:
+            # summary the magnitude of gradients from different losses w.r.t. predicted image
+            gradients_summary(losses['g_loss'], batch_predicted, name='g_loss')
+            gradients_summary(losses['g_loss'], x2, name='g_loss_to_x2')
+            # gradients_summary(losses['ae_loss'], x1, name='ae_loss_to_x1')
+            gradients_summary(losses['ae_loss'], x2, name='ae_loss_to_x2')
+        losses['g_loss'] = FLAGS.gan_loss_alpha * losses['g_loss']
+        if FLAGS.ae_loss:
+            losses['g_loss'] += losses['ae_loss']
+        g_vars = tf.get_collection(
+            tf.GraphKeys.TRAINABLE_VARIABLES, 'inpaint_net')
+        d_vars = tf.get_collection(
+            tf.GraphKeys.TRAINABLE_VARIABLES, 'discriminator')
+        return g_vars, d_vars, losses,batch_complete
+    
     def build_graph_with_losses(
             self, FLAGS, batch_data, training=True, summary=False,
             reuse=False):
@@ -189,6 +283,7 @@ class InpaintCAModel(Model):
             # conditional GANs
             batch_pos_neg = tf.concat([batch_pos_neg, tf.tile(edge, [2, 1, 1, 1])], axis=3)
         # wgan with gradient penalty
+        print(FLAGS.gan)
         if FLAGS.gan == 'sngan':
             pos_neg = self.build_gan_discriminator(batch_pos_neg, training=training, reuse=reuse)
             pos, neg = tf.split(pos_neg, 2)
